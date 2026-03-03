@@ -6,6 +6,7 @@ const About = () => {
     return (
         <View style={styles.container}>
             <Text>About Screen</Text>
+            <Text>Used to be commutity page</Text>
         </View>
     )
 }
