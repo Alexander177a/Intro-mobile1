@@ -27,6 +27,7 @@
     },
     "plugins": [
       "expo-router",
+       ["expo-image-picker", { "photosPermission": "Geef toegang tot je foto's." }],
       [
         "expo-splash-screen",
         {
