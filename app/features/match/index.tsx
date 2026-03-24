@@ -3,7 +3,10 @@ import {
   View, Text, StyleSheet, ScrollView, TouchableOpacity,
   Switch, Alert, ActivityIndicator
 } from 'react-native';
-import { getFirestore, collection, addDoc, query, where, getDocs, serverTimestamp } from 'firebase/firestore';
+import {
+  getFirestore, collection, addDoc, query, where,
+  getDocs, onSnapshot, serverTimestamp, doc, setDoc
+} from 'firebase/firestore';
 import { getAuth } from 'firebase/auth';
 import { app } from '../../../src/firebase/firebaseConfig';
 import { useRouter, Stack } from 'expo-router';
@@ -12,28 +15,43 @@ import { Ionicons } from '@expo/vector-icons';
 const db = getFirestore(app);
 const auth = getAuth(app);
 
-const CLUBS = [
-  { id: '1', name: 'Padel 4U2',           city: 'Antwerpen' },
-  { id: '2', name: 'Smash Padel Club',     city: 'Gent' },
-  { id: '3', name: 'Padel Arena Brussels', city: 'Brussel' },
-  { id: '4', name: 'Royal Padel Club',     city: 'Brugge' },
-  { id: '5', name: 'Padel One',            city: 'Leuven' },
-  { id: '6', name: 'The Padel Factory',    city: 'Mechelen' },
-];
+//////////////////////
+// TYPES
+//////////////////////
 
-const TIMES = ['09:00', '10:30', '12:00', '14:00', '16:00', '17:30', '19:00', '20:30'];
+type Slot = {
+  id: string;
+  startTime: string;
+  date: string;
+  isBooked: boolean;
+  bookedBy?: string;
+};
+
+type Club = {
+  id: string;
+  name?: string;
+  city?: string;
+};
+
+//////////////////////
+// CONSTANTS
+//////////////////////
+
 const DAYS_NL = ['ZO', 'MA', 'DI', 'WO', 'DO', 'VR', 'ZA'];
 const MONTHS_NL = ['JAN', 'FEB', 'MRT', 'APR', 'MEI', 'JUN', 'JUL', 'AUG', 'SEP', 'OKT', 'NOV', 'DEC'];
-const LEVEL_OPTIONS = ['0.5', '1.0', '1.5', '2.0', '2.5', '3.0', '3.5', '4.0', '4.5', '5.0', '5.5', '6.0', '6.5', '7.0'];
+const LEVEL_OPTIONS = ['0.5','1.0','1.5','2.0','2.5','3.0','3.5','4.0','4.5','5.0','5.5','6.0','6.5','7.0'];
 
 const generateDays = () => {
   const days = [];
   const today = new Date();
   today.setHours(0, 0, 0, 0);
+
   for (let i = 0; i < 14; i++) {
     const d = new Date(today);
     d.setDate(today.getDate() + i);
+
     const fullDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
     days.push({
       date: d.getDate(),
       month: MONTHS_NL[d.getMonth()],
@@ -41,6 +59,7 @@ const generateDays = () => {
       fullDate,
     });
   }
+
   return days;
 };
 
@@ -48,40 +67,107 @@ export default function CreateMatchScreen() {
   const router = useRouter();
   const DAYS = generateDays();
 
+  const [clubs, setClubs] = useState<Club[]>([]);
+  const [slots, setSlots] = useState<Slot[]>([]);
+
   const [selectedDay, setSelectedDay] = useState(DAYS[0]);
   const [selectedTime, setSelectedTime] = useState<string | null>(null);
-  const [selectedClub, setSelectedClub] = useState<typeof CLUBS[0] | null>(null);
+  const [selectedClub, setSelectedClub] = useState<Club | null>(null);
+
   const [minLevel, setMinLevel] = useState('1.0');
   const [maxLevel, setMaxLevel] = useState('3.0');
   const [isCompetitive, setIsCompetitive] = useState(false);
   const [isMixed, setIsMixed] = useState(false);
+
   const [loading, setLoading] = useState(false);
-  const [takenSlots, setTakenSlots] = useState<string[]>([]);
 
+  //////////////////////
+  // 🔥 LOCATIONS
+  //////////////////////
   useEffect(() => {
-    if (!selectedDay || !selectedClub) return;
-    loadTakenSlots(selectedDay.fullDate, selectedClub.id);
-  }, [selectedDay, selectedClub]);
+    const unsubscribe = onSnapshot(collection(db, 'locations'), (snapshot) => {
+      const data = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...(doc.data() as Omit<Club, 'id'>),
+      }));
+      setClubs(data);
+    });
 
-  const loadTakenSlots = async (date: string, clubId: string) => {
-    try {
-      const q = query(
-        collection(db, 'matches'),
-        where('fullDate', '==', date),
-        where('clubId', '==', clubId),
-        where('status', '==', 'open')
-      );
-      const snap = await getDocs(q);
-      const taken = snap.docs.map(d => d.data().time as string);
-      setTakenSlots(taken);
-      if (selectedTime && taken.includes(selectedTime)) setSelectedTime(null);
-    } catch (e) {
-      console.warn('Kon tijdsloten niet laden:', e);
+    return () => unsubscribe();
+  }, []);
+
+  //////////////////////
+  // 🔥 ENSURE SLOTS
+  //////////////////////
+  const ensureSlotsExist = async (date: string, clubId: string) => {
+    const q = query(
+      collection(db, 'locations', clubId, 'timeslots'),
+      where('date', '==', date)
+    );
+
+    const snap = await getDocs(q);
+
+    if (snap.empty) {
+      const times: string[] = [];
+
+      for (let h = 8; h < 22; h++) {
+        times.push(`${String(h).padStart(2, '0')}:00`);
+        times.push(`${String(h).padStart(2, '0')}:30`);
+      }
+
+      for (const t of times) {
+        await addDoc(collection(db, 'locations', clubId, 'timeslots'), {
+          startTime: t,
+          date,
+          isBooked: false,
+        });
+      }
     }
   };
 
+  //////////////////////
+  // 🔥 LOAD SLOTS
+  //////////////////////
+  useEffect(() => {
+    if (!selectedClub || !selectedDay) return;
+
+    let unsubscribe: any;
+
+    const init = async () => {
+      await ensureSlotsExist(selectedDay.fullDate, selectedClub.id);
+
+      const q = query(
+        collection(db, 'locations', selectedClub.id, 'timeslots'),
+        where('date', '==', selectedDay.fullDate)
+      );
+
+      unsubscribe = onSnapshot(q, (snapshot) => {
+        const data = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...(doc.data() as Omit<Slot, 'id'>),
+        })) as Slot[];
+
+        data.sort((a, b) => a.startTime.localeCompare(b.startTime));
+
+        setSlots(data);
+
+        if (selectedTime && data.some(s => s.startTime === selectedTime && s.isBooked)) {
+          setSelectedTime(null);
+        }
+      });
+    };
+
+    init();
+
+    return () => unsubscribe && unsubscribe();
+  }, [selectedClub, selectedDay]);
+
+  //////////////////////
+  // 🔥 CREATE MATCH
+  //////////////////////
   const handleCreateMatch = async () => {
     const user = auth.currentUser;
+
     if (!user) return Alert.alert('Fout', 'Je moet ingelogd zijn.');
     if (!selectedTime) return Alert.alert('Fout', 'Kies een tijdstip.');
     if (!selectedClub) return Alert.alert('Fout', 'Kies een club.');
@@ -89,20 +175,25 @@ export default function CreateMatchScreen() {
       return Alert.alert('Fout', 'Min niveau moet lager zijn dan max niveau.');
 
     setLoading(true);
+
     try {
-      const q = query(
-        collection(db, 'matches'),
-        where('fullDate', '==', selectedDay.fullDate),
-        where('clubId', '==', selectedClub.id),
-        where('time', '==', selectedTime),
-        where('status', '==', 'open')
-      );
-      const snap = await getDocs(q);
-      if (!snap.empty) {
-        await loadTakenSlots(selectedDay.fullDate, selectedClub.id);
-        return Alert.alert('Bezet', 'Dit tijdslot is net ingenomen. Kies een ander tijdstip.');
+      const slotToBook = slots.find(s => s.startTime === selectedTime);
+
+      if (!slotToBook || slotToBook.isBooked === true) {
+        return Alert.alert('Bezet', 'Dit tijdslot is niet meer beschikbaar.');
       }
 
+      // 🔥 SLOT BOEKEN
+      await setDoc(
+        doc(db, 'locations', selectedClub.id, 'timeslots', slotToBook.id),
+        {
+          ...slotToBook,
+          isBooked: true,
+          bookedBy: user.uid,
+        }
+      );
+
+      // 🔥 MATCH
       await addDoc(collection(db, 'matches'), {
         hostId: user.uid,
         clubId: selectedClub.id,
@@ -122,19 +213,24 @@ export default function CreateMatchScreen() {
 
       Alert.alert('Match gepubliceerd!', 'Je match staat nu in de lijst.');
       router.back();
+
     } catch (e) {
-      Alert.alert('Fout', 'Er ging iets mis bij het opslaan.');
+        console.error('MATCH ERROR:', e);
+        Alert.alert('Fout', 'Er ging iets mis bij het opslaan.');
     } finally {
       setLoading(false);
     }
   };
 
+
   return (
     <View style={styles.container}>
       <Stack.Screen options={{ title: 'Match aanmaken', headerShadowVisible: false }} />
+
       <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.scroll}>
 
         <Text style={styles.sectionTitle}>Wanneer</Text>
+
         <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.hScroll}>
           {DAYS.map((item) => (
             <TouchableOpacity
@@ -156,22 +252,25 @@ export default function CreateMatchScreen() {
         </ScrollView>
 
         <Text style={styles.sectionTitle}>Tijdslot</Text>
+
         {!selectedClub && (
           <Text style={styles.hint}>Kies eerst een club om beschikbaarheid te zien</Text>
         )}
+
         <View style={styles.timeGrid}>
-          {TIMES.map((t) => {
-            const isTaken = takenSlots.includes(t);
-            const isSelected = selectedTime === t;
+          {slots.map((slot) => {
+            const isTaken = slot.isBooked;
+            const isSelected = selectedTime === slot.startTime;
+
             return (
               <TouchableOpacity
-                key={t}
+                key={slot.id}
                 style={[
                   styles.timeChip,
                   isSelected && styles.timeChipActive,
                   isTaken && styles.timeChipTaken,
                 ]}
-                onPress={() => !isTaken && setSelectedTime(t)}
+                onPress={() => !isTaken && setSelectedTime(slot.startTime)}
                 disabled={isTaken}
               >
                 <Text style={[
@@ -179,18 +278,20 @@ export default function CreateMatchScreen() {
                   isSelected && styles.textWhite,
                   isTaken && styles.timeTextTaken,
                 ]}>
-                  {t}
+                  {slot.startTime}
                 </Text>
-                {isTaken && <Text style={styles.takenLabel}>bezet</Text>}
+
               </TouchableOpacity>
             );
           })}
         </View>
 
         <Text style={styles.sectionTitle}>Club</Text>
+
         <View style={styles.clubList}>
-          {CLUBS.map((club) => {
+          {clubs.map((club) => {
             const isSelected = selectedClub?.id === club.id;
+
             return (
               <TouchableOpacity
                 key={club.id}
@@ -200,17 +301,25 @@ export default function CreateMatchScreen() {
                 <View style={[styles.clubIcon, isSelected && styles.clubIconActive]}>
                   <Ionicons name="location" size={18} color={isSelected ? '#fff' : '#0057FF'} />
                 </View>
+
                 <View style={styles.clubInfo}>
-                  <Text style={[styles.clubName, isSelected && styles.textWhite]}>{club.name}</Text>
-                  <Text style={[styles.clubCity, isSelected && styles.textWhiteLight]}>{club.city}</Text>
+                  <Text style={[styles.clubName, isSelected && styles.textWhite]}>
+                    {club.name}
+                  </Text>
+                  <Text style={[styles.clubCity, isSelected && styles.textWhiteLight]}>
+                    {club.city}
+                  </Text>
                 </View>
+
                 {isSelected && <Ionicons name="checkmark-circle" size={20} color="#fff" />}
               </TouchableOpacity>
             );
           })}
         </View>
 
+        {/* NIVEAU */}
         <Text style={styles.sectionTitle}>Niveau range</Text>
+
         <View style={styles.levelBox}>
           <Text style={styles.levelLabel}>Min niveau</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false}>
@@ -225,6 +334,7 @@ export default function CreateMatchScreen() {
             ))}
           </ScrollView>
         </View>
+
         <View style={styles.levelBox}>
           <Text style={styles.levelLabel}>Max niveau</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false}>
@@ -240,6 +350,7 @@ export default function CreateMatchScreen() {
           </ScrollView>
         </View>
 
+        {/* SWITCHES */}
         <View style={styles.switchCard}>
           <View style={styles.switchRow}>
             <View>
@@ -248,7 +359,9 @@ export default function CreateMatchScreen() {
             </View>
             <Switch value={isCompetitive} onValueChange={setIsCompetitive} trackColor={{ true: '#0057FF' }} />
           </View>
+
           <View style={styles.divider} />
+
           <View style={styles.switchRow}>
             <View>
               <Text style={styles.switchTitle}>Gemengd (Mixed)</Text>
@@ -258,6 +371,7 @@ export default function CreateMatchScreen() {
           </View>
         </View>
 
+        {/* BUTTON */}
         <TouchableOpacity style={styles.submitBtn} onPress={handleCreateMatch} disabled={loading}>
           {loading
             ? <ActivityIndicator color="#fff" />
@@ -269,6 +383,7 @@ export default function CreateMatchScreen() {
     </View>
   );
 }
+
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#fff' },
